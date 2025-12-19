@@ -1,8 +1,10 @@
-const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, REST, Routes, SlashCommandBuilder, MessageFlags } = require('discord.js');
 const fs = require('fs');
 const ms = require('ms');
 const { MongoClient, ServerApiVersion } = require('mongodb');
 require('dotenv').config();
+
+const PREFIX = '/'; // Préfixe pour les commandes textuelles
 
 const client = new Client({
   intents: [
@@ -68,7 +70,33 @@ const commands = [
     .addStringOption(option =>
       option.setName('userid')
         .setDescription('L\'ID du membre à débannir')
-        .setRequired(true))
+        .setRequired(true)),
+  new SlashCommandBuilder()
+    .setName('clear')
+    .setDescription('Supprime les messages récents du salon')
+    .addIntegerOption(option =>
+      option.setName('amount')
+        .setDescription('Nombre de messages à supprimer (1-100)')
+        .setRequired(false)
+        .setMinValue(1)
+        .setMaxValue(100)),
+  new SlashCommandBuilder()
+    .setName('message')
+    .setDescription('Gère les messages')
+    .addSubcommand(subcommand =>
+      subcommand
+        .setName('efface')
+        .setDescription('Supprime les messages d\'un membre')
+        .addUserOption(option =>
+          option.setName('user')
+            .setDescription('Le membre dont supprimer les messages')
+            .setRequired(true))
+        .addIntegerOption(option =>
+          option.setName('amount')
+            .setDescription('Nombre de messages à vérifier (1-100)')
+            .setRequired(false)
+            .setMinValue(1)
+            .setMaxValue(100)))
 ];
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
@@ -119,7 +147,27 @@ if (process.env.MONGODB_URI) {
 }
 
 // Charger les données
-let db = { mutes: [], config: { staffRoleId: '1423018980465049734', logsChannelId: '1423018982494961679' } };
+let db = { 
+  mutes: [], 
+  config: { 
+    staffRoleId: '1423018980465049734', 
+    logsChannelId: '1423018982494961679',
+    protections: {
+      antiSpam: { enabled: true, maxMessages: 5, timeWindow: 5000, action: 'mute', duration: '10m' },
+      antiInsultes: { enabled: true, words: ['insulte1', 'insulte2', 'con', 'pute', 'salope', 'enculé', 'fdp', 'pd', 'ntm', 'tg', 'fuck', 'shit', 'bitch', 'asshole'], action: 'delete', warn: true },
+      antiRaid: { enabled: true, maxJoins: 5, timeWindow: 10000, action: 'ban' },
+      antiNuke: { enabled: true, maxActions: 10, timeWindow: 10000, action: 'lockdown' },
+      antiCaps: { enabled: true, threshold: 70, minLength: 10, action: 'delete' },
+      antiGhostPing: { enabled: true, action: 'warn' },
+      antiLinks: { enabled: false, whitelist: [], action: 'delete' }
+    }
+  }
+};
+
+// Maps pour les protections automatiques
+const spamTracker = new Map();
+const raidTracker = new Map();
+const nukeTracker = new Map();
 async function loadDB() {
   if (mongoClient && mongoClient.topology && mongoClient.topology.isConnected()) {
     try {
@@ -165,6 +213,219 @@ async function saveDB() {
       console.error('Erreur sauvegarde data.json:', err);
     }
   }
+}
+
+async function lockdownGuild(guild, reason) {
+  try {
+    // Créer un rôle de lockdown
+    const lockdownRole = await guild.roles.create({
+      name: '🔒 Lockdown',
+      permissions: [],
+      reason: 'Protection anti-nuke automatique'
+    });
+
+    // Appliquer aux canaux texte
+    for (const channel of guild.channels.cache.values()) {
+      if (channel.type === 0) { // GUILD_TEXT
+        await channel.permissionOverwrites.edit(lockdownRole, {
+          SendMessages: false,
+          AddReactions: false
+        }).catch(() => {});
+      }
+    }
+
+    sendLog(guild, '🔒 Lockdown Activé', `🛡️ **Protection anti-nuke**\n📄 Raison : ${reason}\n👮 Rôle créé : ${lockdownRole.name}`, 'Red');
+  } catch (err) {
+    console.error('Erreur lockdown:', err.message);
+  }
+}
+
+async function checkAntiSpam(message) {
+  if (message.author.bot || !db.config?.protections) return;
+
+  const userId = message.author.id;
+  const now = Date.now();
+  const config = db.config.protections.antiSpam;
+
+  if (!spamTracker.has(userId)) {
+    spamTracker.set(userId, []);
+  }
+
+  const userMessages = spamTracker.get(userId);
+  userMessages.push(now);
+
+  // Nettoyer les messages anciens
+  const recentMessages = userMessages.filter(time => now - time < config.timeWindow);
+
+  if (recentMessages.length > config.maxMessages) {
+    // Action anti-spam
+    if (config.action === 'mute') {
+      const member = message.member;
+      if (member && !member.roles.cache.has(db.config.staffRoleId)) {
+        const duration = ms(config.duration);
+        await applyTempMute(member, duration, 'Anti-Spam automatique', null);
+        sendLog(message.guild, '🚫 Anti-Spam', `👤 **${message.author.tag}** détecté pour spam\n⏱️ Sanction : Mute ${config.duration}`, 'Orange');
+      }
+    }
+
+    // Supprimer les messages récents
+    try {
+      const messagesToDelete = await message.channel.messages.fetch({ limit: 10 });
+      const userRecentMessages = messagesToDelete.filter(msg => 
+        msg.author.id === userId && 
+        Date.now() - msg.createdTimestamp < 10000
+      );
+      if (userRecentMessages.size > 0) {
+        await message.channel.bulkDelete(userRecentMessages, true);
+      }
+    } catch (err) {
+      console.error('Erreur suppression spam:', err.message);
+    }
+  }
+
+  spamTracker.set(userId, recentMessages);
+}
+
+async function checkAntiInsultes(message) {
+  if (message.author.bot || !db.config?.protections) return;
+
+  const config = db.config.protections.antiInsultes;
+  const content = message.content.toLowerCase();
+
+  const hasInsulte = config.words.some(word => content.includes(word.toLowerCase()));
+
+  if (hasInsulte) {
+    if (config.action === 'delete') {
+      try {
+        await message.delete();
+        sendLog(message.guild, '🚫 Anti-Insultes', `👤 **${message.author.tag}** a utilisé un mot interdit\n💬 Message supprimé`, 'Red');
+        
+        if (config.warn) {
+          const warnEmbed = new EmbedBuilder()
+            .setTitle('⚠️ Avertissement')
+            .setDescription('Votre message contenait un mot interdit et a été supprimé.')
+            .setColor('Orange')
+            .setFooter({ text: 'Comportez-vous correctement sur ce serveur.' });
+          
+          message.author.send({ embeds: [warnEmbed] }).catch(() => {});
+        }
+      } catch (err) {
+        console.error('Erreur anti-insultes:', err.message);
+      }
+    }
+  }
+}
+
+async function checkAntiCaps(message) {
+  if (message.author.bot || !db.config?.protections) return;
+
+  const config = db.config.protections.antiCaps;
+  const content = message.content;
+
+  if (content.length < config.minLength) return;
+
+  const capsCount = (content.match(/[A-Z]/g) || []).length;
+  const capsPercentage = (capsCount / content.length) * 100;
+
+  if (capsPercentage >= config.threshold) {
+    if (config.action === 'delete') {
+      try {
+        await message.delete();
+        sendLog(message.guild, '🚫 Anti-Caps', `👤 **${message.author.tag}** a utilisé trop de majuscules (${capsPercentage.toFixed(1)}%)\n💬 Message supprimé`, 'Orange');
+      } catch (err) {
+        console.error('Erreur anti-caps:', err.message);
+      }
+    }
+  }
+}
+
+async function checkAntiGhostPing(message) {
+  if (message.author.bot || !db.config?.protections) return;
+
+  const mentionedUsers = message.mentions.users;
+  if (mentionedUsers.size === 0) return;
+
+  // Vérifier si des mentions ont été supprimées (ghost ping)
+  setTimeout(async () => {
+    try {
+      const currentMessage = await message.channel.messages.fetch(message.id);
+      const currentMentions = currentMessage.mentions.users;
+
+      if (currentMentions.size < mentionedUsers.size) {
+        sendLog(message.guild, '👻 Ghost Ping Détecté', `👤 **${message.author.tag}** a supprimé des mentions\n💬 Message original : ${message.content.substring(0, 100)}...`, 'Yellow');
+        
+        if (db.config.protections.antiGhostPing.action === 'warn') {
+          message.author.send('⚠️ **Ghost ping détecté** : Évitez de mentionner puis supprimer vos messages.').catch(() => {});
+        }
+      }
+    } catch (err) {
+      // Message supprimé ou inaccessible
+    }
+  }, 1000);
+}
+
+async function checkAntiRaid(member) {
+  if (!db.config?.protections) return;
+
+  const guild = member.guild;
+  const now = Date.now();
+  const config = db.config.protections.antiRaid;
+
+  if (!raidTracker.has(guild.id)) {
+    raidTracker.set(guild.id, []);
+  }
+
+  const joins = raidTracker.get(guild.id);
+  joins.push(now);
+
+  // Nettoyer les anciens joins
+  const recentJoins = joins.filter(time => now - time < config.timeWindow);
+
+  if (recentJoins.length > config.maxJoins) {
+    // Action anti-raid
+    if (config.action === 'ban') {
+      try {
+        await member.ban({ reason: 'Anti-raid automatique - Join massif détecté' });
+        sendLog(guild, '🚫 Anti-Raid', `👤 **${member.user.tag}** banni automatiquement\n📊 ${recentJoins.length} joins en ${config.timeWindow/1000}s`, 'Red');
+      } catch (err) {
+        console.error('Erreur anti-raid ban:', err.message);
+      }
+    }
+  }
+
+  raidTracker.set(guild.id, recentJoins);
+}
+
+async function checkAntiNuke(guild, action) {
+  if (!db.config?.protections) return;
+
+  const now = Date.now();
+  const config = db.config.protections.antiNuke;
+
+  if (!nukeTracker.has(guild.id)) {
+    nukeTracker.set(guild.id, { actions: [], lastReset: now });
+  }
+
+  const tracker = nukeTracker.get(guild.id);
+  
+  // Reset si plus de 1 minute
+  if (now - tracker.lastReset > 60000) {
+    tracker.actions = [];
+    tracker.lastReset = now;
+  }
+
+  tracker.actions.push(now);
+
+  // Garder seulement les actions récentes
+  tracker.actions = tracker.actions.filter(time => now - time < config.timeWindow);
+
+  if (tracker.actions.length > config.maxActions) {
+    if (config.action === 'lockdown') {
+      await lockdownGuild(guild, `Nuke détecté : ${tracker.actions.length} actions en ${config.timeWindow/1000}s`);
+    }
+  }
+
+  nukeTracker.set(guild.id, tracker);
 }
 
 function sendLog(guild, title, description, color) {
@@ -215,7 +476,7 @@ async function applyTempMute(member, duration, reason, interaction = null) {
     const mutedRole = await getMutedRole(member.guild);
     if (!mutedRole) {
       if (interaction) {
-        await interaction.reply({ content: '❌ Impossible de créer/trouver le rôle Muted', ephemeral: true });
+        return interaction.reply({ content: '❌ **Erreur** : Impossible de créer ou trouver le rôle "Muted". Vérifiez les permissions du bot.', flags: MessageFlags.Ephemeral });
       }
       return false;
     }
@@ -251,8 +512,8 @@ async function applyTempMute(member, duration, reason, interaction = null) {
     console.error('Erreur applyTempMute:', err.message);
     if (interaction) {
       await interaction.reply({ 
-        content: `❌ Erreur lors du mute: ${err.message === 'Missing Permissions' ? 'Permissions insuffisantes (le bot doit avoir un rôle plus élevé que la cible)' : err.message}`, 
-        ephemeral: true 
+        content: `❌ **Erreur lors du mute** : ${err.message === 'Missing Permissions' ? 'Permissions insuffisantes (le bot doit avoir un rôle plus élevé que la cible)' : 'Une erreur inattendue est survenue. Réessayez plus tard.'}`, 
+        flags: MessageFlags.Ephemeral 
       }).catch(() => {});
     }
     return false;
@@ -332,7 +593,17 @@ process.on('unhandledRejection', err => {
 
 client.on('messageCreate', async message => {
   try {
-    if (message.author.bot || !message.content.startsWith(PREFIX)) return;
+    // Ignorer les messages des bots
+    if (message.author.bot) return;
+    
+    // Protections automatiques
+    await checkAntiSpam(message);
+    await checkAntiInsultes(message);
+    await checkAntiCaps(message);
+    await checkAntiGhostPing(message);
+
+    // Vérifier si c'est une commande
+    if (!message.content.startsWith(PREFIX)) return;
     if (!message.guild) return;
 
     const args = message.content.slice(PREFIX.length).trim().split(/ +/);
@@ -347,11 +618,14 @@ client.on('messageCreate', async message => {
         .setTitle('🛡️ Aide du bot de modération')
         .setDescription('Voici les commandes disponibles sur le serveur :')
         .addFields(
-          { name: '🔇 TempMute', value: '`/tempmute ID`\nMute temporairement un membre via un menu de sanctions.' },
-          { name: '🔊 Unmute', value: '`/unmute ID`\nRetire le mute d\'un membre.' },
-          { name: '🔨 Ban', value: '`/ban ID raison`\nBannit un membre du serveur.' },
-          { name: '🔓 Unban', value: '`/unban ID`\nDébannit un membre via son ID.' },
-          { name: '⚙️ Config', value: '`/config staff @role`\nDéfinit le rôle staff.\n`/config logs #channel`\nDéfinit le canal de logs.' }
+          { name: '🔇 TempMute', value: '`/tempmute @user`\nMute temporairement un membre via un menu de sanctions.' },
+          { name: '🔊 Unmute', value: '`/unmute @user`\nRetire le mute d\'un membre.' },
+          { name: '🔨 Ban', value: '`/ban @user [raison]`\nBannit un membre du serveur.' },
+          { name: '🔓 Unban', value: '`/unban <ID>`\nDébannit un membre via son ID.' },
+          { name: '🗑️ Clear', value: '`/clear [nombre]`\nSupprime les messages récents du salon.' },
+          { name: '📝 Message Efface', value: '`/message efface @user [nombre]`\nSupprime les messages d\'un membre.' },
+          { name: '⚙️ Config', value: '`/config staff @role`\nDéfinit le rôle staff.\n`/config logs #channel`\nDéfinit le canal de logs.' },
+          { name: '🛡️ Protections Automatiques', value: '🔥 **Anti-Spam** : Toujours actif - détecte et sanctionne le spam\n🚫 **Anti-Insultes** : Toujours actif - supprime les messages avec insultes\n🚨 **Anti-Raid** : Toujours actif - bloque les joins massifs\n💥 **Anti-Nuke** : Toujours actif - protège contre la destruction massive\n📢 **Anti-Caps** : Toujours actif - contrôle l\'usage excessif des majuscules\n👻 **Anti-Ghost Ping** : Toujours actif - détecte les mentions supprimées' }
         )
         .setColor('Blue')
         .setFooter({ text: 'Bot de modération • Sécurité active' });
@@ -393,20 +667,20 @@ client.on('messageCreate', async message => {
     if (cmd === 'tempmute') {
       const userId = args[0];
       if (!userId) {
-        return message.reply('❌ Merci de fournir un **ID utilisateur**').catch(() => {});
+        return message.reply('❌ **Erreur** : Merci de fournir un **ID utilisateur** ou de mentionner un membre.').catch(() => {});
       }
 
       const member = await message.guild.members.fetch(userId).catch(() => null);
       if (!member) {
-        return message.reply('❌ Utilisateur introuvable').catch(() => {});
+        return message.reply('❌ **Utilisateur introuvable** : Vérifiez l\'ID ou la mention.').catch(() => {});
       }
 
       if (member.id === message.author.id) {
-        return message.reply('❌ Vous ne pouvez pas vous mute vous-même').catch(() => {});
+        return message.reply('❌ **Action interdite** : Vous ne pouvez pas vous sanctionner vous-même.').catch(() => {});
       }
 
       if (member.roles.cache.has(db.config.staffRoleId)) {
-        return message.reply('❌ Vous ne pouvez pas mute un membre du staff').catch(() => {});
+        return message.reply('❌ **Action interdite** : Vous ne pouvez pas sanctionner un membre du staff.').catch(() => {});
       }
 
       const menu = new StringSelectMenuBuilder()
@@ -494,11 +768,61 @@ client.on('messageCreate', async message => {
   }
 });
 
+// Protection anti-raid
+client.on('guildMemberAdd', async member => {
+  try {
+    await checkAntiRaid(member);
+  } catch (err) {
+    console.error('Erreur anti-raid:', err.message);
+  }
+});
+
+// Protection anti-nuke
+client.on('channelCreate', async channel => {
+  try {
+    await checkAntiNuke(channel.guild, 'channelCreate');
+  } catch (err) {
+    console.error('Erreur anti-nuke channelCreate:', err.message);
+  }
+});
+
+client.on('channelDelete', async channel => {
+  try {
+    await checkAntiNuke(channel.guild, 'channelDelete');
+  } catch (err) {
+    console.error('Erreur anti-nuke channelDelete:', err.message);
+  }
+});
+
+client.on('roleCreate', async role => {
+  try {
+    await checkAntiNuke(role.guild, 'roleCreate');
+  } catch (err) {
+    console.error('Erreur anti-nuke roleCreate:', err.message);
+  }
+});
+
+client.on('roleDelete', async role => {
+  try {
+    await checkAntiNuke(role.guild, 'roleDelete');
+  } catch (err) {
+    console.error('Erreur anti-nuke roleDelete:', err.message);
+  }
+});
+
+client.on('guildBanAdd', async (ban) => {
+  try {
+    await checkAntiNuke(ban.guild, 'banAdd');
+  } catch (err) {
+    console.error('Erreur anti-nuke banAdd:', err.message);
+  }
+});
+
 client.on('interactionCreate', async interaction => {
   try {
     if (interaction.isChatInputCommand()) {
       if (interaction.commandName !== 'help' && !interaction.member.roles.cache.has(db.config.staffRoleId)) {
-        return interaction.reply({ content: '❌ Vous n\'avez pas la permission d\'utiliser cette commande.', ephemeral: true });
+        return interaction.reply({ content: '❌ **Accès refusé** : Vous devez avoir le rôle staff pour utiliser cette commande.', flags: MessageFlags.Ephemeral });
       }
 
       if (interaction.commandName === 'help') {
@@ -510,7 +834,10 @@ client.on('interactionCreate', async interaction => {
             { name: '🔊 Unmute', value: '`/unmute @user`\nRetire le mute d\'un membre.' },
             { name: '🔨 Ban', value: '`/ban @user [raison]`\nBannit un membre du serveur.' },
             { name: '🔓 Unban', value: '`/unban <ID>`\nDébannit un membre via son ID.' },
-            { name: '⚙️ Config', value: '`/config staff @role`\nDéfinit le rôle staff.\n`/config logs #channel`\nDéfinit le canal de logs.' }
+            { name: '🗑️ Clear', value: '`/clear [nombre]`\nSupprime les messages récents du salon.' },
+            { name: '📝 Message Efface', value: '`/message efface @user [nombre]`\nSupprime les messages d\'un membre.' },
+            { name: '⚙️ Config', value: '`/config staff @role`\nDéfinit le rôle staff.\n`/config logs #channel`\nDéfinit le canal de logs.' },
+            { name: '🛡️ Protections Automatiques', value: '🔥 **Anti-Spam** : Toujours actif - détecte et sanctionne le spam\n🚫 **Anti-Insultes** : Toujours actif - supprime les messages avec insultes\n🚨 **Anti-Raid** : Toujours actif - bloque les joins massifs\n💥 **Anti-Nuke** : Toujours actif - protège contre la destruction massive\n📢 **Anti-Caps** : Toujours actif - contrôle l\'usage excessif des majuscules\n👻 **Anti-Ghost Ping** : Toujours actif - détecte les mentions supprimées' }
           )
           .setColor('Blue')
           .setFooter({ text: 'Bot de modération • Sécurité active' });
@@ -540,15 +867,15 @@ client.on('interactionCreate', async interaction => {
         const user = interaction.options.getUser('user');
         const member = await interaction.guild.members.fetch(user.id).catch(() => null);
         if (!member) {
-          return interaction.reply({ content: '❌ Utilisateur introuvable', ephemeral: true });
+          return interaction.reply({ content: '❌ **Utilisateur introuvable** : Vérifiez que ce membre est sur le serveur.', flags: MessageFlags.Ephemeral });
         }
 
         if (member.id === interaction.user.id) {
-          return interaction.reply({ content: '❌ Vous ne pouvez pas vous mute vous-même', ephemeral: true });
+          return interaction.reply({ content: '❌ **Action interdite** : Vous ne pouvez pas vous sanctionner vous-même.', flags: MessageFlags.Ephemeral });
         }
 
         if (member.roles.cache.has(db.config.staffRoleId)) {
-          return interaction.reply({ content: '❌ Vous ne pouvez pas mute un membre du staff', ephemeral: true });
+          return interaction.reply({ content: '❌ **Action interdite** : Vous ne pouvez pas sanctionner un membre du staff.', flags: MessageFlags.Ephemeral });
         }
 
         const menu = new StringSelectMenuBuilder()
@@ -575,15 +902,15 @@ client.on('interactionCreate', async interaction => {
         const user = interaction.options.getUser('user');
         const member = await interaction.guild.members.fetch(user.id).catch(() => null);
         if (!member) {
-          return interaction.reply({ content: '❌ Utilisateur introuvable', ephemeral: true });
+          return interaction.reply({ content: '❌ **Utilisateur introuvable** : Vérifiez que ce membre est sur le serveur.', flags: MessageFlags.Ephemeral });
         }
 
         const success = await unmute(member, false);
         if (success) {
           sendLog(interaction.guild, '🔊 Unmute', `👤 **${member.user.tag}** unmute par ${interaction.user.tag}`, 'Green');
-          return interaction.reply('✅ Membre unmute avec succès');
+          return interaction.reply('✅ **Succès** : Membre unmute avec succès.');
         } else {
-          return interaction.reply('❌ Ce membre n\'est pas mute ou une erreur est survenue');
+          return interaction.reply('❌ **Erreur** : Ce membre n\'est pas mute ou une erreur est survenue.');
         }
       }
 
@@ -593,19 +920,19 @@ client.on('interactionCreate', async interaction => {
         const member = await interaction.guild.members.fetch(user.id).catch(() => null);
         
         if (!member) {
-          return interaction.reply({ content: '❌ Utilisateur introuvable', ephemeral: true });
+          return interaction.reply({ content: '❌ **Utilisateur introuvable** : Vérifiez que ce membre est sur le serveur.', flags: MessageFlags.Ephemeral });
         }
 
         if (!member.bannable) {
-          return interaction.reply({ content: '❌ Je ne peux pas bannir ce membre (permissions insuffisantes)', ephemeral: true });
+          return interaction.reply({ content: '❌ **Permissions insuffisantes** : Le bot ne peut pas bannir ce membre (rôle trop élevé).', flags: MessageFlags.Ephemeral });
         }
 
         try {
           await member.ban({ reason });
           sendLog(interaction.guild, '🔨 Ban', `👤 **${member.user.tag}**\n📄 Raison : ${reason}\n👮 Par : ${interaction.user.tag}`, 'Red');
-          return interaction.reply(`✅ **${member.user.tag}** a été banni`);
+          return interaction.reply(`✅ **Succès** : **${member.user.tag}** a été banni.`);
         } catch (err) {
-          return interaction.reply(`❌ Erreur lors du ban: ${err.message}`);
+          return interaction.reply(`❌ **Erreur lors du ban** : Une erreur inattendue est survenue.`);
         }
       }
 
@@ -615,9 +942,57 @@ client.on('interactionCreate', async interaction => {
         try {
           await interaction.guild.members.unban(userId);
           sendLog(interaction.guild, '🔓 Unban', `👤 Utilisateur ID : **${userId}**\n👮 Par : ${interaction.user.tag}`, 'Green');
-          return interaction.reply('✅ Utilisateur débanni avec succès');
+          return interaction.reply('✅ **Succès** : Utilisateur débanni avec succès.');
         } catch (err) {
-          return interaction.reply(`❌ Erreur lors du unban: ${err.message}`);
+          return interaction.reply(`❌ **Erreur lors du unban** : ID invalide ou utilisateur non banni.`);
+        }
+      }
+
+      if (interaction.commandName === 'clear') {
+        const amount = interaction.options.getInteger('amount') || 50;
+
+        try {
+          const messages = await interaction.channel.messages.fetch({ limit: amount });
+          const filteredMessages = messages.filter(msg => 
+            Date.now() - msg.createdTimestamp < 14 * 24 * 60 * 60 * 1000 // 14 days
+          );
+
+          if (filteredMessages.size === 0) {
+            return interaction.reply({ content: '❌ **Aucun message** : Aucun message récent à supprimer.', flags: MessageFlags.Ephemeral });
+          }
+
+          await interaction.channel.bulkDelete(filteredMessages, true);
+          sendLog(interaction.guild, '🗑️ Clear', `🧹 **${filteredMessages.size}** messages supprimés dans ${interaction.channel.name}\n👮 Par : ${interaction.user.tag}`, 'Orange');
+          return interaction.reply(`✅ **Succès** : **${filteredMessages.size}** messages supprimés.`);
+        } catch (err) {
+          return interaction.reply({ content: '❌ **Erreur** : Impossible de supprimer les messages (permissions insuffisantes ou messages trop anciens).', flags: MessageFlags.Ephemeral });
+        }
+      }
+
+      if (interaction.commandName === 'message') {
+        const subCmd = interaction.options.getSubcommand();
+
+        if (subCmd === 'efface') {
+          const user = interaction.options.getUser('user');
+          const amount = interaction.options.getInteger('amount') || 50;
+
+          try {
+            const messages = await interaction.channel.messages.fetch({ limit: amount });
+            const userMessages = messages.filter(msg => 
+              msg.author.id === user.id && 
+              Date.now() - msg.createdTimestamp < 14 * 24 * 60 * 60 * 1000 // 14 days
+            );
+
+            if (userMessages.size === 0) {
+              return interaction.reply({ content: `❌ **Aucun message** : Aucun message récent de **${user.tag}** à supprimer.`, flags: MessageFlags.Ephemeral });
+            }
+
+            await interaction.channel.bulkDelete(userMessages, true);
+            sendLog(interaction.guild, '🗑️ Message Efface', `🧹 **${userMessages.size}** messages de **${user.tag}** supprimés dans ${interaction.channel.name}\n👮 Par : ${interaction.user.tag}`, 'Orange');
+            return interaction.reply(`✅ **Succès** : **${userMessages.size}** messages de **${user.tag}** supprimés.`);
+          } catch (err) {
+            return interaction.reply({ content: '❌ **Erreur** : Impossible de supprimer les messages (permissions insuffisantes ou messages trop anciens).', flags: MessageFlags.Ephemeral });
+          }
         }
       }
     }
@@ -628,7 +1003,7 @@ client.on('interactionCreate', async interaction => {
         const member = await interaction.guild.members.fetch(userId).catch(() => null);
         
         if (!member) {
-          return interaction.reply({ content: '❌ Utilisateur introuvable', ephemeral: true }).catch(() => {});
+          return interaction.reply({ content: '❌ **Erreur** : Utilisateur introuvable (il a peut-être quitté le serveur).', flags: MessageFlags.Ephemeral }).catch(() => {});
         }
 
         const sanctionMap = {
@@ -642,7 +1017,7 @@ client.on('interactionCreate', async interaction => {
 
         const sanction = sanctionMap[interaction.values[0]];
         if (!sanction) {
-          return interaction.reply({ content: '❌ Sanction invalide', ephemeral: true }).catch(() => {});
+          return interaction.reply({ content: '❌ **Erreur** : Sanction invalide sélectionnée.', flags: MessageFlags.Ephemeral }).catch(() => {});
         }
 
         const duration = ms(sanction.duration);
@@ -650,14 +1025,14 @@ client.on('interactionCreate', async interaction => {
 
         if (success) {
           sendLog(interaction.guild, '🔇 TempMute', `👤 **${member.user.tag}** mute pour **${sanction.reason}** (${sanction.duration}) par ${interaction.user.tag}`, 'Orange');
-          await interaction.reply({ content: `✅ **${member.user.tag}** a été mute pour **${sanction.reason}** (${sanction.duration})`, ephemeral: true }).catch(() => {});
+          await interaction.reply({ content: `✅ **${member.user.tag}** a été mute pour **${sanction.reason}** (${sanction.duration})`, flags: MessageFlags.Ephemeral }).catch(() => {});
         }
       }
     }
   } catch (err) {
     console.error('Erreur interactionCreate:', err.message);
     if (interaction.replied || interaction.deferred) return;
-    interaction.reply({ content: '❌ Une erreur est survenue', ephemeral: true }).catch(() => {});
+    interaction.reply({ content: '❌ **Erreur inattendue** : Une erreur est survenue. Réessayez dans quelques instants.', flags: MessageFlags.Ephemeral }).catch(() => {});
   }
 });
 

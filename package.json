@@ -4,7 +4,8 @@
   "description": "Bot de modération Discord",
   "main": "bots",
   "scripts": {
-    "start": "node bots"
+    "start": "node start.js",
+    "dev": "node start.js"
   },
   "dependencies": {
     "@discordjs/rest": "^2.6.0",

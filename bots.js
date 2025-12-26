@@ -121,7 +121,7 @@ const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 })();
 
 // Connexion MongoDB
-const uri = process.env.MONGODB_URI || "mongodb+srv://akkro1234_db_user:<db_password>@cluster0.wwcryjd.mongodb.net/?appName=Cluster0";
+const uri = process.env.MONGODB_URI || "mongodb://localhost:27017/discordbot";
 const mongoClient = new MongoClient(uri, {
   serverApi: {
     version: ServerApiVersion.v1,
@@ -577,7 +577,7 @@ setInterval(async () => {
   }
 }, 10000);
 
-client.once('clientReady', async () => {
+client.once('ready', async () => {
   await loadDB();
   console.log(`✅ Bot connecté : ${client.user.tag}`);
   console.log(`📊 Serveurs : ${client.guilds.cache.size}`);

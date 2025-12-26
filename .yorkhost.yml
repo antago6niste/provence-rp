@@ -1,0 +1,20 @@
+name: discord-bot-provence
+runtime: node
+version: '20'
+
+build:
+  command: npm install
+
+start:
+  command: npm start
+  port: 3000
+
+environment:
+  NODE_ENV: production
+  DISCORD_TOKEN: ${DISCORD_TOKEN}
+  CLIENT_ID: ${CLIENT_ID}
+  MONGODB_URI: ${MONGODB_URI}
+
+resources:
+  memory: 512MB
+  cpu: 0.5
